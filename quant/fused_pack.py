@@ -3,111 +3,98 @@ Fused quantization and bit-packing kernel for KIVI KV cache compression.
 
 Replaces the multi-step pipeline in new_pack.py:
     Triton minmax kernel → PyTorch sub/div/clamp/round/cast → Triton pack kernel
-with a single Triton kernel, achieving:
-    - 7+ kernel launches → 1 kernel launch
-    - Elimination of all intermediate tensor allocations (scale broadcast, int32 cast, etc.)
-    - Data read from global memory only twice (Phase 1: minmax, Phase 2: quantize+pack,
-      where Phase 2 benefits from L2 cache locality)
+with a single Triton kernel.
+
+Key design choices vs. the naive fused approach:
+    1. Data reshaped to (N*num_groups, group_size) BEFORE entering the kernel,
+       so the stride between consecutive rows is group_size (e.g. 32) instead of T
+       (e.g. 672).  This gives ~20× better memory coalescing.
+    2. Full group loaded at once in Phase 1 (single vectorised tl.load of
+       [BLOCK_SIZE, group_size]) for min/max — no streaming loop needed.
+    3. Phase 2 re-reads in feat_per_int chunks; because the working set per
+       thread-block is only BLOCK_SIZE × group_size × 2 B (≈ 8 KB for the
+       typical 128 × 32 tile), the re-reads hit per-SM L1 cache (128 KB on
+       Ampere) with near-100 % hit rate.
+    4. 1-D grid — simpler scheduling, fewer concurrent programs competing for
+       L2 bandwidth.
 
 Drop-in replacement for `triton_quantize_and_pack_along_last_dim` in new_pack.py.
 """
 
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 import torch
 import numpy as np
 
 
 @triton.jit
-def _fused_quant_and_pack_along_last_dim(
+def _fused_quant_pack(
     bits: tl.constexpr,
     data_ptr,
     code_ptr,
     scale_ptr,
     mn_ptr,
-    N,                              # total number of rows = B * nh * D
-    num_groups,                     # T // group_size
-    group_size: tl.constexpr,       # quantization group size (e.g. 32, 64, 128)
-    feat_per_int: tl.constexpr,     # 32 // bits (e.g. 16 for 2-bit, 8 for 4-bit)
-    T_packed,                       # T // feat_per_int
-    BLOCK_SIZE_N: tl.constexpr,     # number of rows per program
+    num_rows,                       # N * num_groups  (one row = one quant group)
+    group_size: tl.constexpr,       # elements per quantization group (32, 64, 128)
+    feat_per_int: tl.constexpr,     # 32 // bits  (16 for 2-bit, 8 for 4-bit)
+    packed_per_group: tl.constexpr, # group_size // feat_per_int
+    BLOCK_SIZE: tl.constexpr,       # rows per program
 ):
     """
-    Fused min-max asymmetric quantization + bit-packing kernel.
+    Fused min-max asymmetric quantization + bit-packing.
 
-    Grid: (cdiv(N, BLOCK_SIZE_N), num_groups)
-    Each program handles BLOCK_SIZE_N rows for one group.
+    Data layout: (num_rows, group_size), row-major, contiguous.
+    Grid:  1-D,  (cdiv(num_rows, BLOCK_SIZE),)
 
-    Phase 1 — Min/Max:
-        Load data in chunks of feat_per_int elements, compute running min/max per row.
-
-    Phase 2 — Quantize + Pack:
-        Reload same chunks (L2-cached), quantize to [0, 2^bits - 1], bit-pack
-        feat_per_int quantized values into one int32 using shift-and-sum.
-        Since each quantized value occupies non-overlapping bit positions,
-        integer addition is equivalent to bitwise OR.
+    Phase 1 — Load full group [BLOCK_SIZE, group_size], compute per-row
+              min / max entirely from registers.
+    Phase 2 — Re-read the same data in [BLOCK_SIZE, feat_per_int] chunks
+              (L1-cached), quantise to [0, 2^bits − 1], bit-pack
+              feat_per_int values into one int32 via shift-and-sum.
     """
     max_int: tl.constexpr = (1 << bits) - 1
-    packed_per_group: tl.constexpr = group_size // feat_per_int
 
-    pid_n = tl.program_id(0)
-    pid_g = tl.program_id(1)
+    pid = tl.program_id(0)
+    row_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_mask = row_offs < num_rows
 
-    # Row indices for this program
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)).to(tl.int64)
-    mask_n = offs_n < N
+    # Base byte-offset for each row (stride = group_size between rows)
+    base = row_offs * group_size
 
-    # Base offset into data for this group: data[n, g * group_size]
-    T = num_groups * group_size
-    base = offs_n * T + pid_g * group_size
+    # ======================== Phase 1: full-group min / max ========================
+    cols = tl.arange(0, group_size)
+    data = tl.load(data_ptr + (base[:, None] + cols[None, :]),
+                   mask=row_mask[:, None], other=0.0)
 
-    # ======================== Phase 1: Compute min and max ========================
-    running_min = tl.full((BLOCK_SIZE_N,), float('inf'), dtype=tl.float32)
-    running_max = tl.full((BLOCK_SIZE_N,), float('-inf'), dtype=tl.float32)
+    row_min = tl.min(data, axis=1)          # fp16 native — no precision loss
+    row_max = tl.max(data, axis=1)
 
-    for p in tl.static_range(packed_per_group):
-        offs_feat = tl.arange(0, feat_per_int).to(tl.int64)
-        data_offs = base[:, None] + (p * feat_per_int + offs_feat[None, :])
-        chunk = tl.load(data_ptr + data_offs, mask=mask_n[:, None], other=0.0).to(tl.float32)
-
-        chunk_min = tl.min(chunk, axis=1)
-        chunk_max = tl.max(chunk, axis=1)
-        running_min = tl.minimum(running_min, chunk_min)
-        running_max = tl.maximum(running_max, chunk_max)
-
-    scale_val = (running_max - running_min) / max_int
+    mn_f32 = row_min.to(tl.float32)
+    scale_val = (row_max.to(tl.float32) - mn_f32) / max_int
     inv_scale = 1.0 / (scale_val + 1e-10)
 
-    # Store scale and mn (as fp16, matching original implementation)
-    sm_offs = offs_n * num_groups + pid_g
-    tl.store(scale_ptr + sm_offs, scale_val.to(tl.float16), mask=mask_n)
-    tl.store(mn_ptr + sm_offs, running_min.to(tl.float16), mask=mask_n)
+    tl.store(scale_ptr + row_offs, scale_val.to(tl.float16), mask=row_mask)
+    tl.store(mn_ptr   + row_offs, mn_f32.to(tl.float16),     mask=row_mask)
 
-    # ======================== Phase 2: Quantize + Bit-Pack ========================
+    # ======================== Phase 2: quantise + bit-pack ========================
     for p in tl.static_range(packed_per_group):
-        offs_feat = tl.arange(0, feat_per_int).to(tl.int64)
-        data_offs = base[:, None] + (p * feat_per_int + offs_feat[None, :])
-        # Reload from global memory (should hit L2 cache from Phase 1)
-        chunk = tl.load(data_ptr + data_offs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        feat_offs = p * feat_per_int + tl.arange(0, feat_per_int)
+        chunk = tl.load(data_ptr + (base[:, None] + feat_offs[None, :]),
+                        mask=row_mask[:, None], other=0.0).to(tl.float32)
 
-        # Quantize: q = round(clamp((x - mn) / scale, 0, max_int))
-        q = (chunk - running_min[:, None]) * inv_scale[:, None]
-        q = tl.math.rint(q)
+        # Quantise: round(clamp((x − mn) / scale, 0, max_int))
+        q = (chunk - mn_f32[:, None]) * inv_scale[:, None]
+        q = libdevice.rint(q)
         q = tl.maximum(tl.minimum(q, float(max_int)), 0.0)
         q_int = q.to(tl.int32)
 
-        # Bit-pack: shift each quantized value to its bit position and sum.
-        # Since bit positions are non-overlapping, integer sum == bitwise OR.
-        # Example for 2-bit, feat_per_int=16:
-        #   q_int[0] << 0  occupies bits [0, 1]
-        #   q_int[1] << 2  occupies bits [2, 3]
-        #   ...
-        #   q_int[15] << 30 occupies bits [30, 31]
+        # Bit-pack: shift each quantised value to its bit lane and sum.
         shift = (tl.arange(0, feat_per_int) * bits).to(tl.int32)
         packed = tl.sum(q_int << shift[None, :], axis=1)
 
-        out_offs = offs_n * T_packed + pid_g * packed_per_group + p
-        tl.store(code_ptr + out_offs, packed, mask=mask_n)
+        tl.store(code_ptr + row_offs * packed_per_group + p,
+                 packed, mask=row_mask)
 
 
 def triton_fused_quantize_and_pack_along_last_dim(
@@ -129,54 +116,48 @@ def triton_fused_quantize_and_pack_along_last_dim(
     """
     assert len(data.shape) == 4
     assert bit in (2, 4), "Only 2-bit and 4-bit quantization are supported"
-    shape = data.shape
-    B, nh, D, T = shape
+    B, nh, D, T = data.shape
 
     assert T % group_size == 0, f"T ({T}) must be divisible by group_size ({group_size})"
     num_groups = T // group_size
     feat_per_int = 32 // bit
+    packed_per_group = group_size // feat_per_int
     assert group_size % feat_per_int == 0, (
         f"group_size ({group_size}) must be divisible by feat_per_int ({feat_per_int})"
     )
 
     N = B * nh * D
-    data_flat = data.reshape(N, T)
-    T_packed = T // feat_per_int
+    num_rows = N * num_groups
 
-    # Allocate output tensors (no intermediate tensors needed!)
-    code = torch.empty((N, T_packed), device=data.device, dtype=torch.int32)
-    scale = torch.empty((N, num_groups), device=data.device, dtype=data.dtype)
-    mn = torch.empty((N, num_groups), device=data.device, dtype=data.dtype)
+    # ---- Critical layout change ----
+    # Reshape to (num_rows, group_size) so that the stride between consecutive
+    # rows is group_size (e.g. 32) rather than T (e.g. 672).
+    # This dramatically improves memory coalescing for both phases.
+    data_2d = data.reshape(num_rows, group_size)
 
-    # Choose BLOCK_SIZE_N based on problem size
-    if N < 64:
-        BLOCK_SIZE_N = 32
-    elif N < 256:
-        BLOCK_SIZE_N = 64
-    else:
-        BLOCK_SIZE_N = 128
+    code  = torch.empty((num_rows, packed_per_group), device=data.device, dtype=torch.int32)
+    scale = torch.empty(num_rows, device=data.device, dtype=data.dtype)
+    mn    = torch.empty(num_rows, device=data.device, dtype=data.dtype)
 
-    grid = (triton.cdiv(N, BLOCK_SIZE_N), num_groups)
+    BLOCK_SIZE = 128
+    grid = (triton.cdiv(num_rows, BLOCK_SIZE),)
 
     with torch.cuda.device(data.device):
-        _fused_quant_and_pack_along_last_dim[grid](
+        _fused_quant_pack[grid](
             bit,
-            data_flat,
-            code,
-            scale,
-            mn,
-            N,
-            num_groups,
+            data_2d, code, scale, mn,
+            num_rows,
             group_size,
             feat_per_int,
-            T_packed,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            packed_per_group,
+            BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4,
         )
 
+    T_packed = T // feat_per_int
     scale_mn_shape = (B, nh, D, num_groups)
     return (
-        code.reshape(B, nh, D, -1),
+        code.reshape(B, nh, D, T_packed),
         scale.reshape(scale_mn_shape),
         mn.reshape(scale_mn_shape),
     )
@@ -188,8 +169,8 @@ def triton_fused_quantize_and_pack_along_last_dim(
 
 def _dequantize_packed(code, scale, mn, group_size, bit):
     """Dequantize packed tensor back to fp16 for correctness checking."""
-    from new_pack import unpack_and_dequant_kcache
-    return unpack_and_dequant_kcache(code, scale.unsqueeze(-1), mn.unsqueeze(-1), group_size, bit)
+    from new_pack import unpack_and_dequant_vcache
+    return unpack_and_dequant_vcache(code, scale.unsqueeze(-1), mn.unsqueeze(-1), group_size, bit)
 
 
 def test_correctness():
@@ -210,6 +191,9 @@ def test_correctness():
         (1, 8, 128, 64, 32, 4),
         (1, 32, 128, 1024, 64, 2),
         (4, 32, 128, 128, 32, 2),
+        # Shapes matching the real model (longchat-7b, ~702 tokens, residual=32)
+        (1, 32, 128, 640, 32, 2),   # K-cache after transpose: (B, nh, D, T_quant)
+        (1, 32, 640, 128, 32, 2),   # V-cache: (B, nh, T_quant, D)
     ]
 
     all_passed = True
@@ -261,10 +245,12 @@ def benchmark():
 
     configs = [
         # (B, nh, D, T, group_size, bit, label)
+        (1, 32, 128, 640, 32, 2,  "K-cache prefill (real)"),
+        (1, 32, 640, 128, 32, 2,  "V-cache prefill (real)"),
         (1, 32, 128, 1024, 32, 2, "Typical decode K-cache"),
         (1, 32, 128, 4096, 64, 2, "Long context K-cache"),
-        (1, 32, 128, 128, 32, 2, "Short V-cache"),
-        (1, 32, 128, 4096, 128, 2, "Long context, large group"),
+        (1, 32, 128, 128, 32, 2,  "Short V-cache"),
+        (1, 32, 128, 4096, 128, 2,"Long context, large group"),
         (1, 32, 128, 4096, 64, 4, "4-bit quantization"),
     ]
 

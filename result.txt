@@ -1,0 +1,27 @@
+原始attention
+TTFT:123.07ms  Throughput: 28.99 tokens/s (1000 new tokens in 34500.04ms)
+
+旧kernel
+TTFT:166.31ms Throughput: 14.68 tokens/s  (1000 new tokens in 68127.25 ms)
+TTFT:213.43ms Throughput: 14.38 tokens/s  (1000 new tokens in 69549.01 ms)
+TTFT:160.17ms Throughput: 13.14 tokens/s  (1000 new tokens in 76127.61 ms)
+TTFT:147.10ms Throughput: 14.51 tokens/s  (1000 new tokens in 68895.56 ms)
+
+new kernel
+TTFT:146.95ms Throughput: 14.52 tokens/s  (1000 new tokens in 68884.36 ms)
+TTFT:141.89ms Throughput: 13.12 tokens/s  (1000 new tokens in 76223.98 ms)
+TTFT:145.81ms Throughput: 13.08 tokens/s  (1000 new tokens in 76468.10 ms)
+
+
+
+
+
+new 
+TTFT:93.97 ms Throughput: 29.34 tokens/s  (1000 new tokens in 34087.75 ms)
+TTFT:94.92 ms Throughput: 29.43 tokens/s  (1000 new tokens in 33982.49 ms)
+TTFT:89.85 ms Throughput: 29.53 tokens/s  (1000 new tokens in 33868.05 ms)
+
+old
+TTFT:95.29 ms Throughput: 24.28 tokens/s  (1000 new tokens in 41187.59 ms)
+TTFT:98.15 ms Throughput: 24.29 tokens/s  (1000 new tokens in 41175.71 ms)
+TTFT:99.36 ms Throughput: 23.97 tokens/s  (1000 new tokens in 41722.57 ms)
