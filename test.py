@@ -7,10 +7,12 @@ import json
 from transformers import LlamaConfig, AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 
+import quant.quant_flash_decode as kernel
+
 enable_kivi = True
 enable_new_kernel = False
-model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-#model_path = "lmsys/longchat-7b-v1.5-32k"
+#model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+model_path = "lmsys/longchat-7b-v1.5-32k"
 config = LlamaConfig.from_pretrained(model_path)
 config.k_bits = 2 # KiVi currently support 2/4 K/V bits
 config.v_bits = 2
@@ -95,3 +97,5 @@ for line in open(file_name, "r"):
     print( f"TTFT:       {ttft * 1000:.2f} ms" )
     print( f"Throughput: {throughput:.2f} tokens/s  "
            f"({new_tokens} new tokens in {total_gen_time * 1000:.2f} ms)" )
+    
+    print(kernel.total_time)

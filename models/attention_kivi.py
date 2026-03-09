@@ -26,6 +26,7 @@ from torch import nn
 
 from quant.new_pack import triton_quantize_and_pack_along_last_dim
 from quant.matmul import cuda_bmm_fA_qB_outer
+from quant.quant_flash_decode import quant_flash_decode
 from manager.kv_cache import QuantKVCache
 
 from transformers.models.llama.configuration_llama import *
@@ -131,9 +132,12 @@ class LlamaFlashAttention_KIVI_Opt(nn.Module):
             # DECODE: quantized attention, then index-based cache update
             # =============================================================
             past_key_value.update_decode(key_states, value_states)
-            attn_output = self._decode_forward(
+            #attn_output = self._decode_forward(
+            #    query_states, key_states, value_states,
+            ##)
+            attn_output = self._decode_forward_fused(
                 query_states, key_states, value_states,
-                past_key_value, attention_mask, bsz, q_len, kv_seq_len,
+                past_key_value, bsz,
             )
             
 
@@ -238,6 +242,63 @@ class LlamaFlashAttention_KIVI_Opt(nn.Module):
         # [B, n_heads, q_len, D] → [B, q_len, hidden]
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output.reshape(bsz, q_len, -1)
+    
+        # ------------------------------------------------------------------
+    # Decode: fused QuantFlashDecoding (NEW)
+    # ------------------------------------------------------------------
+
+    def _decode_forward_fused(self, query_states, new_key, new_value,
+                              cache, bsz):
+        """
+        Fused decode attention using QuantFlashDecoding kernel.
+        
+        Key change: write-before-read ordering.
+        
+        Old flow (Phase 1):
+          1. read cache → 2. cat new token → 3. compute attention → 4. update cache
+          Problem: step 2 allocates temporary tensors
+          
+        New flow:
+          1. update cache (write new token, may trigger flush)
+          2. read cache (now includes new token)
+          3. compute attention via fused kernel
+          No cat, no temporary tensors.
+        
+        Correctness argument:
+          - update_decode writes new_key/new_value at position full_len, increments full_len
+          - If flush triggers: front window is quantized, back window moves to front,
+            full_len resets to window_size. The flushed tokens now appear in quant buffers.
+          - get_quant_k/v and get_full_kv now return the complete state including new token.
+          - The fused kernel sees exactly the same data as the old flow's cat'd tensors.
+        """
+        # --- Step 1: Write new token to cache ---
+        ## cache.update_decode(new_key, new_value)
+
+        # --- Step 2: Read cache state (now includes new token) ---
+        k_q, k_s, k_m = cache.get_quant_k()    # quantized K slices or (None, None, None)
+        v_q, v_s, v_m = cache.get_quant_v()    # quantized V slices or (None, None, None)
+        k_full, v_full = cache.get_full_kv()    # full-precision K, V slices
+
+        # --- Step 3: Fused attention ---
+        attn_output = quant_flash_decode(
+            q=query_states,             # [B, H_q, 1, D]
+            k_quant=k_q,               # [B, H_kv, D, L_q_packed] or None
+            k_scale=k_s,
+            k_mn=k_m,
+            v_quant=v_q,               # [B, H_kv, L_q, D_packed] or None
+            v_scale=v_s,
+            v_mn=v_m,
+            k_full=k_full,             # [B, H_kv, L_f, D]
+            v_full=v_full,
+            group_size=self.group_size,
+            bits=self.k_bits,          # assume k_bits == v_bits
+            chunk_size=max(self.group_size, 32),  # must be >= group_size
+        )
+
+        # attn_output: [B, H_q, 1, D] → transpose to [B, 1, H_q, D] for reshape
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        
+        return attn_output
     
     def _flash_attention_forward(
         self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None

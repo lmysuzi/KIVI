@@ -1,20 +1,19 @@
+longchat
+
 原始attention
-TTFT:123.07ms  Throughput: 28.99 tokens/s (1000 new tokens in 34500.04ms)
+TTFT:121.99ms Throughput: 36.55 tokens/s  (1000 new tokens in 27358.74 ms)
+TTFT:122.46ms Throughput: 36.51 tokens/s  (1000 new tokens in 27389.31 ms)
 
 旧kernel
-TTFT:166.31ms Throughput: 14.68 tokens/s  (1000 new tokens in 68127.25 ms)
-TTFT:213.43ms Throughput: 14.38 tokens/s  (1000 new tokens in 69549.01 ms)
-TTFT:160.17ms Throughput: 13.14 tokens/s  (1000 new tokens in 76127.61 ms)
-TTFT:147.10ms Throughput: 14.51 tokens/s  (1000 new tokens in 68895.56 ms)
+TTFT:142.01ms Throughput: 17.85 tokens/s  (1000 new tokens in 56037.96 ms)
+TTFT:142.29ms Throughput: 17.55 tokens/s  (1000 new tokens in 56996.25 ms)
 
 new kernel
-TTFT:146.95ms Throughput: 14.52 tokens/s  (1000 new tokens in 68884.36 ms)
-TTFT:141.89ms Throughput: 13.12 tokens/s  (1000 new tokens in 76223.98 ms)
-TTFT:145.81ms Throughput: 13.08 tokens/s  (1000 new tokens in 76468.10 ms)
+TTFT:142.34ms Throughput: 23.88 tokens/s  (1000 new tokens in 41876.85 ms)
+TTFT:142.62ms Throughput: 23.81 tokens/s  (1000 new tokens in 42005.14 ms)
 
 
-
-
+tinyllama
 
 new 
 TTFT:93.97 ms Throughput: 29.34 tokens/s  (1000 new tokens in 34087.75 ms)
