@@ -35,10 +35,6 @@ import math
 import torch
 import triton
 import triton.language as tl
-
-import time
-
-total_time = 0.0
 # =====================================================================
 # Main Kernel
 # =====================================================================
@@ -383,6 +379,10 @@ def quant_flash_decode(
     
     Returns: [B, H_q, 1, D] fp16
     """
+    import torch
+    torch.cuda.nvtx.range_push("quant_flash_decode_total")
+    
+    torch.cuda.nvtx.range_push("qfd_setup_and_reshape")
     B, H_q, _, D = q.shape
     H_kv = k_full.shape[1]
     L_f = k_full.shape[2]
@@ -409,9 +409,6 @@ def quant_flash_decode(
     BH_kv = B * H_kv
     
     q_flat = q.reshape(BH_q, 1, D).contiguous()
-
-    start_time = time.perf_counter()
-    
     if k_quant is not None:
         k_quant_flat = k_quant.reshape(BH_kv, D, L_q_packed).contiguous()
         k_scale_flat = k_scale.reshape(BH_kv, D, L_q_groups).contiguous()
@@ -431,12 +428,9 @@ def quant_flash_decode(
     k_full_flat = k_full.reshape(BH_kv, L_f, D).contiguous()
     v_full_flat = v_full.reshape(BH_kv, L_f, D).contiguous()
 
-    torch.cuda.synchronize()
-    end_time = time.perf_counter()
-    times = end_time - start_time
-    global total_time
-    total_time = times + total_time
+    torch.cuda.nvtx.range_pop() # end qfd_setup_and_reshape
     
+    torch.cuda.nvtx.range_push("qfd_allocate_buffers")
     # Allocate intermediate buffers
     out_partial = torch.empty(BH_q, num_chunks, D, dtype=torch.float32, device=q.device)
     lse = torch.empty(BH_q, num_chunks, dtype=torch.float32, device=q.device)
@@ -445,6 +439,9 @@ def quant_flash_decode(
     BLOCK_D = min(64, D)
     assert D % BLOCK_D == 0, f"D ({D}) must be divisible by BLOCK_D ({BLOCK_D})"
     
+    torch.cuda.nvtx.range_pop() # end qfd_allocate_buffers
+    
+    torch.cuda.nvtx.range_push("qfd_main_kernel")
     # Launch main kernel
     grid_main = (num_chunks, BH_q)
     quant_flash_decode_kernel[grid_main](
@@ -461,6 +458,9 @@ def quant_flash_decode(
         CHUNK_SIZE=chunk_size, BLOCK_D=BLOCK_D,
     )
     
+    torch.cuda.nvtx.range_pop() # end qfd_main_kernel
+    
+    torch.cuda.nvtx.range_push("qfd_reduce_kernel")
     # Launch reduce kernel
     MAX_CHUNKS = triton.next_power_of_2(num_chunks)
     grid_reduce = (BH_q,)
@@ -473,7 +473,15 @@ def quant_flash_decode(
         BLOCK_D=BLOCK_D, MAX_CHUNKS=MAX_CHUNKS,
     )
     
-    return final_out.reshape(B, H_q, 1, D)
+    torch.cuda.nvtx.range_pop() # end qfd_reduce_kernel
+    
+    torch.cuda.nvtx.range_push("qfd_final_reshape")
+    ret = final_out.reshape(B, H_q, 1, D)
+    torch.cuda.nvtx.range_pop() # end qfd_final_reshape
+    
+    torch.cuda.nvtx.range_pop() # end quant_flash_decode_total
+    
+    return ret
 
 
 # =====================================================================
